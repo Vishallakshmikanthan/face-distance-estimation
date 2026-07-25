@@ -1,6 +1,6 @@
 """Real-time monocular face distance and horizontal angle estimation.
 
-Uses MediaPipe Face Detection (or OpenCV Haar Cascade / YuNet / Contour fallbacks) and the pinhole camera model:
+Uses MediaPipe Face Detection or OpenCV YuNet / Haar Cascade face detectors and the pinhole camera model:
     Z = (f * W) / w_px
     theta = atan((center_x - c_x) / f) * (180 / pi)
 """
@@ -16,6 +16,8 @@ from typing import Iterable, Sequence
 
 
 DEFAULT_FACE_WIDTH_M = 0.15
+YUNET_MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
+YUNET_MODEL_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 
 
 @dataclass(frozen=True)
@@ -194,31 +196,36 @@ def draw_overlay(frame, estimates: list[FaceEstimate], focal_length_px: float) -
         (12, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
-        (255, 255, 255),
+        (0, 255, 255),
         2,
         cv2.LINE_AA,
     )
 
     for estimate in estimates:
         x, y, w, h = estimate.x_px, estimate.y_px, estimate.w_px, estimate.h_px
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 220, 0), 2)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
         label = f"Face {estimate.index}: Z={estimate.distance_m:.2f}m, theta={estimate.angle_deg:+.1f}deg"
         label_y = max(24, y - 10)
+
+        # Text background rectangle for enhanced readability
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(frame, (x, label_y - th - 4), (x + tw + 6, label_y + 4), (0, 0, 0), -1)
+
         cv2.putText(
             frame,
             label,
-            (x, label_y),
+            (x + 3, label_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
-            (0, 220, 0),
+            (0, 255, 0),
             2,
             cv2.LINE_AA,
         )
 
 
 def detect_fallback_boxes(frame) -> list[tuple[int, int, int, int]]:
-    """Fallback contour/blob bounding box detector for test frames when cascade/neural models are absent."""
+    """Fallback contour/blob bounding box detector for test synthetic frames."""
     import cv2
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -235,20 +242,67 @@ def detect_fallback_boxes(frame) -> list[tuple[int, int, int, int]]:
 
 
 class OpenCVDetector:
-    """Cross-version OpenCV face detector supporting Haar Cascade and contour fallbacks."""
+    """Robust OpenCV face detector supporting YuNet (FaceDetectorYN), Haar Cascade, and fallbacks."""
 
-    def __init__(self, cv2_module):
+    def __init__(self, cv2_module, model_dir: Path = Path(".")):
         self.cv2 = cv2_module
+        self.yunet = None
         self.cascade = None
+        self.name = "OpenCV"
 
-        if hasattr(cv2_module, "CascadeClassifier") and hasattr(cv2_module, "data"):
+        # 1. Try YuNet (FaceDetectorYN)
+        if hasattr(cv2_module, "FaceDetectorYN"):
+            model_path = model_dir / YUNET_MODEL_FILENAME
+            if not model_path.exists():
+                try:
+                    import urllib.request
+
+                    print(f"Downloading YuNet face detection model to {model_path}...")
+                    urllib.request.urlretrieve(YUNET_MODEL_URL, str(model_path))
+                    print("Download complete.")
+                except Exception as exc:
+                    print(f"Could not download YuNet model automatically: {exc}")
+
+            if model_path.exists():
+                try:
+                    self.yunet = cv2_module.FaceDetectorYN.create(
+                        model=str(model_path),
+                        config="",
+                        input_size=(640, 480),
+                        score_threshold=0.5,
+                        nms_threshold=0.3,
+                        top_k=5000,
+                    )
+                    self.name = "OpenCV YuNet"
+                except Exception as exc:
+                    print(f"Failed to initialize YuNet detector: {exc}")
+
+        # 2. Try Haar Cascade (for OpenCV 4.x)
+        if self.yunet is None and hasattr(cv2_module, "CascadeClassifier") and hasattr(cv2_module, "data"):
             cascade_path = Path(cv2_module.data.haarcascades) / "haarcascade_frontalface_default.xml"
             if cascade_path.exists():
                 clf = cv2_module.CascadeClassifier(str(cascade_path))
                 if not clf.empty():
                     self.cascade = clf
+                    self.name = "OpenCV Haar"
+
+        if self.yunet is None and self.cascade is None:
+            self.name = "OpenCV Fallback"
 
     def detect(self, frame) -> list[tuple[int, int, int, int]]:
+        h, w = frame.shape[:2]
+
+        if self.yunet is not None:
+            self.yunet.setInputSize((w, h))
+            _, faces = self.yunet.detect(frame)
+            if faces is None:
+                return []
+            boxes = []
+            for face in faces:
+                x, y, bw, bh = face[:4].astype(int)
+                boxes.append((max(0, int(x)), max(0, int(y)), max(1, int(bw)), max(1, int(bh))))
+            return boxes
+
         if self.cascade is not None:
             gray = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2GRAY)
             boxes = self.cascade.detectMultiScale(
@@ -393,7 +447,7 @@ def run(args: argparse.Namespace) -> int:
         )
     else:
         opencv_detector = OpenCVDetector(cv2)
-        detector_name = "OpenCV"
+        detector_name = opencv_detector.name
 
     print(f"Using {detector_name} detector (f={focal_length_px:.1f}px, c_x={principal_x_px:.1f}px). Press q or Esc to exit.")
 
@@ -465,7 +519,7 @@ def parse_args() -> argparse.Namespace:
         "--detector",
         choices=("auto", "mediapipe", "haar"),
         default="auto",
-        help="Face detector backend. auto uses MediaPipe when available, otherwise OpenCV.",
+        help="Face detector backend. auto uses MediaPipe when available, otherwise OpenCV YuNet / Haar.",
     )
     parser.add_argument(
         "--min-confidence",
