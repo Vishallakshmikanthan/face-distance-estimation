@@ -1,4 +1,10 @@
 {
-  "focal_length_px": 640,
-  "note": "Default fallback for a 640px-wide webcam frame. Run calibrate.py for your camera and replace this file."
+  "focal_length_px": 640.0,
+  "f_x": 640.0,
+  "f_y": 640.0,
+  "c_x": 320.0,
+  "c_y": 240.0,
+  "image_width": 640,
+  "image_height": 480,
+  "note": "Default configuration for a standard 640x480 webcam frame. Run calibrate.py to overwrite with your camera parameters."
 }

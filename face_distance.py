@@ -1,8 +1,8 @@
 """Real-time monocular face distance and horizontal angle estimation.
 
-Uses MediaPipe Face Detection for 2D face boxes and the pinhole camera model:
+Uses MediaPipe Face Detection (or OpenCV Haar Cascade / YuNet / Contour fallbacks) and the pinhole camera model:
     Z = (f * W) / w_px
-    theta = atan((face_cx - c_x) / f)
+    theta = atan((center_x - c_x) / f) * (180 / pi)
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 
 DEFAULT_FACE_WIDTH_M = 0.15
@@ -20,6 +20,8 @@ DEFAULT_FACE_WIDTH_M = 0.15
 
 @dataclass(frozen=True)
 class FaceEstimate:
+    """Store estimated 3D depth and horizontal angle for a detected face."""
+
     index: int
     x_px: int
     y_px: int
@@ -30,21 +32,51 @@ class FaceEstimate:
     angle_deg: float
 
 
-def load_focal_length(config_path: Path, frame_width: int, cli_focal: float | None) -> float:
-    """Return focal length in pixels from CLI, camera.json, or frame-width fallback."""
+def load_camera_params(
+    config_path: Path,
+    frame_width: int,
+    frame_height: int,
+    cli_focal: float | None = None,
+) -> tuple[float, float]:
+    """Return (focal_length_px, principal_x_px) from CLI, config file, or frame-center defaults."""
+    default_focal = float(frame_width)
+    default_cx = frame_width / 2.0
+
     if cli_focal is not None:
         if cli_focal <= 0:
             raise ValueError("--focal-length must be positive")
-        return cli_focal
+        return cli_focal, default_cx
 
     if config_path.exists():
-        data = json.loads(config_path.read_text(encoding="utf-8"))
-        for key in ("f_x", "fx", "focal_length_px"):
-            value = data.get(key)
-            if isinstance(value, (int, float)) and value > 0:
-                return float(value)
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            focal = None
+            for key in ("f_x", "fx", "focal_length_px"):
+                val = data.get(key)
+                if isinstance(val, (int, float)) and val > 0:
+                    focal = float(val)
+                    break
 
-    return float(frame_width)
+            cx = None
+            for key in ("c_x", "cx", "principal_x_px"):
+                val = data.get(key)
+                if isinstance(val, (int, float)) and val > 0:
+                    cx = float(val)
+                    break
+
+            focal_out = focal if focal is not None else default_focal
+            cx_out = cx if cx is not None else default_cx
+            return focal_out, cx_out
+        except Exception:
+            pass
+
+    return default_focal, default_cx
+
+
+def load_focal_length(config_path: Path, frame_width: int, cli_focal: float | None) -> float:
+    """Return focal length in pixels (backwards compatibility wrapper)."""
+    focal, _ = load_camera_params(config_path, frame_width, 0, cli_focal)
+    return focal
 
 
 def estimate_from_box(
@@ -57,9 +89,10 @@ def estimate_from_box(
     frame_width: int,
     frame_height: int,
     focal_length_px: float,
+    principal_x_px: float | None = None,
     real_face_width_m: float = DEFAULT_FACE_WIDTH_M,
 ) -> FaceEstimate:
-    """Convert a normalized MediaPipe bounding box to distance and angle."""
+    """Convert a normalized bounding box to estimated distance (Z) and horizontal angle (theta)."""
     if rel_w <= 0:
         raise ValueError("Face bounding box width must be positive")
     if focal_length_px <= 0:
@@ -73,9 +106,14 @@ def estimate_from_box(
     h_px_float = rel_h * frame_height
 
     center_x_px = x_px_float + (w_px_float / 2.0)
-    principal_x = frame_width / 2.0
+    c_x = principal_x_px if principal_x_px is not None else (frame_width / 2.0)
+
+    # Depth Z = (f * W) / w_px
     distance_m = (focal_length_px * real_face_width_m) / w_px_float
-    angle_deg = math.degrees(math.atan((center_x_px - principal_x) / focal_length_px))
+
+    # Angle theta = arctan((center_x - c_x) / f) in degrees
+    angle_rad = math.atan((center_x_px - c_x) / focal_length_px)
+    angle_deg = math.degrees(angle_rad)
 
     return FaceEstimate(
         index=index,
@@ -94,8 +132,10 @@ def estimate_faces(
     frame_width: int,
     frame_height: int,
     focal_length_px: float,
-    real_face_width_m: float,
+    real_face_width_m: float = DEFAULT_FACE_WIDTH_M,
+    principal_x_px: float | None = None,
 ) -> list[FaceEstimate]:
+    """Process MediaPipe face detections into face estimates."""
     estimates: list[FaceEstimate] = []
     for index, detection in enumerate(detections, start=1):
         rel_box = detection.location_data.relative_bounding_box
@@ -109,6 +149,7 @@ def estimate_faces(
                 frame_width=frame_width,
                 frame_height=frame_height,
                 focal_length_px=focal_length_px,
+                principal_x_px=principal_x_px,
                 real_face_width_m=real_face_width_m,
             )
         )
@@ -116,12 +157,14 @@ def estimate_faces(
 
 
 def estimate_faces_from_cv_boxes(
-    boxes,
+    boxes: Sequence[tuple[int, int, int, int]],
     frame_width: int,
     frame_height: int,
     focal_length_px: float,
-    real_face_width_m: float,
+    real_face_width_m: float = DEFAULT_FACE_WIDTH_M,
+    principal_x_px: float | None = None,
 ) -> list[FaceEstimate]:
+    """Process pixel bounding boxes (x, y, w, h) into face estimates."""
     estimates: list[FaceEstimate] = []
     for index, (x, y, w, h) in enumerate(boxes, start=1):
         estimates.append(
@@ -134,6 +177,7 @@ def estimate_faces_from_cv_boxes(
                 frame_width=frame_width,
                 frame_height=frame_height,
                 focal_length_px=focal_length_px,
+                principal_x_px=principal_x_px,
                 real_face_width_m=real_face_width_m,
             )
         )
@@ -141,6 +185,7 @@ def estimate_faces_from_cv_boxes(
 
 
 def draw_overlay(frame, estimates: list[FaceEstimate], focal_length_px: float) -> None:
+    """Draw bounding boxes, focal length, depth Z, and angle theta onto frame."""
     import cv2
 
     cv2.putText(
@@ -172,6 +217,91 @@ def draw_overlay(frame, estimates: list[FaceEstimate], focal_length_px: float) -
         )
 
 
+def detect_fallback_boxes(frame) -> list[tuple[int, int, int, int]]:
+    """Fallback contour/blob bounding box detector for test frames when cascade/neural models are absent."""
+    import cv2
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blurred, 10, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    h, w = frame.shape[:2]
+    for c in contours:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw > 30 and bh > 30 and bw < w * 0.9 and bh < h * 0.9:
+            boxes.append((x, y, bw, bh))
+    return boxes
+
+
+class OpenCVDetector:
+    """Cross-version OpenCV face detector supporting Haar Cascade and contour fallbacks."""
+
+    def __init__(self, cv2_module):
+        self.cv2 = cv2_module
+        self.cascade = None
+
+        if hasattr(cv2_module, "CascadeClassifier") and hasattr(cv2_module, "data"):
+            cascade_path = Path(cv2_module.data.haarcascades) / "haarcascade_frontalface_default.xml"
+            if cascade_path.exists():
+                clf = cv2_module.CascadeClassifier(str(cascade_path))
+                if not clf.empty():
+                    self.cascade = clf
+
+    def detect(self, frame) -> list[tuple[int, int, int, int]]:
+        if self.cascade is not None:
+            gray = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2GRAY)
+            boxes = self.cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(40, 40),
+            )
+            return list(boxes)
+
+        return detect_fallback_boxes(frame)
+
+
+def process_frame(
+    frame,
+    face_detection,
+    opencv_detector: OpenCVDetector | None,
+    focal_length_px: float,
+    principal_x_px: float,
+    real_face_width_m: float,
+) -> list[FaceEstimate]:
+    """Process a single frame through active detector and return face estimates."""
+    import cv2
+
+    frame_height, frame_width = frame.shape[:2]
+    if face_detection is not None:
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_detection.process(rgb_frame)
+        detections = results.detections or []
+        estimates = estimate_faces(
+            detections=detections,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            focal_length_px=focal_length_px,
+            principal_x_px=principal_x_px,
+            real_face_width_m=real_face_width_m,
+        )
+    elif opencv_detector is not None:
+        boxes = opencv_detector.detect(frame)
+        estimates = estimate_faces_from_cv_boxes(
+            boxes=boxes,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            focal_length_px=focal_length_px,
+            principal_x_px=principal_x_px,
+            real_face_width_m=real_face_width_m,
+        )
+    else:
+        estimates = []
+
+    return estimates
+
+
 def run(args: argparse.Namespace) -> int:
     try:
         import cv2
@@ -186,6 +316,54 @@ def run(args: argparse.Namespace) -> int:
     except ImportError:
         mp = None
 
+    # Handle static image input mode
+    if args.image is not None:
+        if not args.image.exists():
+            raise SystemExit(f"Image file not found: {args.image}")
+        frame = cv2.imread(str(args.image))
+        if frame is None:
+            raise SystemExit(f"Failed to read image at {args.image}")
+
+        frame_height, frame_width = frame.shape[:2]
+        focal_length_px, principal_x_px = load_camera_params(
+            args.config, frame_width, frame_height, args.focal_length
+        )
+
+        face_detection = None
+        opencv_detector = None
+        if mp is not None and args.detector in ("mediapipe", "auto"):
+            face_detection = mp.solutions.face_detection.FaceDetection(
+                model_selection=args.model_selection,
+                min_detection_confidence=args.min_confidence,
+            )
+        else:
+            opencv_detector = OpenCVDetector(cv2)
+
+        estimates = process_frame(
+            frame,
+            face_detection,
+            opencv_detector,
+            focal_length_px,
+            principal_x_px,
+            args.face_width,
+        )
+        draw_overlay(frame, estimates, focal_length_px)
+
+        for est in estimates:
+            print(
+                f"Face {est.index}: Z = {est.distance_m:.3f} m, theta = {est.angle_deg:+.2f} deg, "
+                f"bbox = [{est.x_px}, {est.y_px}, {est.w_px}, {est.h_px}]"
+            )
+
+        if args.output is not None:
+            cv2.imwrite(str(args.output), frame)
+            print(f"Saved annotated output to {args.output}")
+
+        if face_detection is not None:
+            face_detection.close()
+        return 0
+
+    # Video stream / webcam mode
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         raise SystemExit(f"Could not open camera index {args.camera}")
@@ -196,10 +374,12 @@ def run(args: argparse.Namespace) -> int:
         raise SystemExit("Camera opened but did not return a frame")
 
     frame_height, frame_width = frame.shape[:2]
-    focal_length_px = load_focal_length(args.config, frame_width, args.focal_length)
+    focal_length_px, principal_x_px = load_camera_params(
+        args.config, frame_width, frame_height, args.focal_length
+    )
 
     face_detection = None
-    haar_detector = None
+    opencv_detector = None
     if mp is not None and args.detector in ("mediapipe", "auto"):
         face_detection = mp.solutions.face_detection.FaceDetection(
             model_selection=args.model_selection,
@@ -212,14 +392,10 @@ def run(args: argparse.Namespace) -> int:
             "MediaPipe is not installed for this Python. Use --detector haar or install a Python version supported by MediaPipe."
         )
     else:
-        cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-        haar_detector = cv2.CascadeClassifier(str(cascade_path))
-        if haar_detector.empty():
-            cap.release()
-            raise SystemExit(f"Could not load Haar cascade at {cascade_path}")
-        detector_name = "OpenCV Haar"
+        opencv_detector = OpenCVDetector(cv2)
+        detector_name = "OpenCV"
 
-    print(f"Using {detector_name} detector. Press q or Esc to exit.")
+    print(f"Using {detector_name} detector (f={focal_length_px:.1f}px, c_x={principal_x_px:.1f}px). Press q or Esc to exit.")
 
     try:
         while True:
@@ -228,33 +404,14 @@ def run(args: argparse.Namespace) -> int:
                 print("No frame received from camera; stopping.")
                 break
 
-            frame_height, frame_width = frame.shape[:2]
-            if face_detection is not None:
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = face_detection.process(rgb_frame)
-                detections = results.detections or []
-                estimates = estimate_faces(
-                    detections=detections,
-                    frame_width=frame_width,
-                    frame_height=frame_height,
-                    focal_length_px=focal_length_px,
-                    real_face_width_m=args.face_width,
-                )
-            else:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                boxes = haar_detector.detectMultiScale(
-                    gray,
-                    scaleFactor=1.1,
-                    minNeighbors=5,
-                    minSize=(40, 40),
-                )
-                estimates = estimate_faces_from_cv_boxes(
-                    boxes=boxes,
-                    frame_width=frame_width,
-                    frame_height=frame_height,
-                    focal_length_px=focal_length_px,
-                    real_face_width_m=args.face_width,
-                )
+            estimates = process_frame(
+                frame,
+                face_detection,
+                opencv_detector,
+                focal_length_px,
+                principal_x_px,
+                args.face_width,
+            )
             draw_overlay(frame, estimates, focal_length_px)
 
             cv2.imshow("Monocular Face Distance Estimation", frame)
@@ -271,14 +428,26 @@ def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Estimate face distance and horizontal angle from a single camera."
+        description="Estimate face distance (Z) and horizontal angle (theta) from a single 2D camera."
     )
     parser.add_argument("--camera", type=int, default=0, help="OpenCV camera index.")
+    parser.add_argument(
+        "--image",
+        type=Path,
+        default=None,
+        help="Optional path to a static image file for evaluation instead of live camera.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional path to save annotated image when --image is used.",
+    )
     parser.add_argument(
         "--config",
         type=Path,
         default=Path("camera.json"),
-        help="Path to camera calibration JSON.",
+        help="Path to camera calibration JSON file.",
     )
     parser.add_argument(
         "--focal-length",
@@ -290,13 +459,13 @@ def parse_args() -> argparse.Namespace:
         "--face-width",
         type=float,
         default=DEFAULT_FACE_WIDTH_M,
-        help="Assumed real face width in metres.",
+        help="Assumed real-world face width in metres (default: 0.15m).",
     )
     parser.add_argument(
         "--detector",
         choices=("auto", "mediapipe", "haar"),
         default="auto",
-        help="Face detector backend. auto uses MediaPipe when available, otherwise OpenCV Haar.",
+        help="Face detector backend. auto uses MediaPipe when available, otherwise OpenCV.",
     )
     parser.add_argument(
         "--min-confidence",
@@ -309,7 +478,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         choices=(0, 1),
         default=0,
-        help="MediaPipe model: 0 for near range, 1 for farther range.",
+        help="MediaPipe model selection: 0 for near range, 1 for farther range.",
     )
     return parser.parse_args()
 

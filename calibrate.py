@@ -98,11 +98,17 @@ def calibrate(args: argparse.Namespace) -> dict:
         None,
     )
 
+    f_x = float(camera_matrix[0, 0])
+    f_y = float(camera_matrix[1, 1])
+    c_x = float(camera_matrix[0, 2])
+    c_y = float(camera_matrix[1, 2])
+
     return {
-        "f_x": float(camera_matrix[0, 0]),
-        "f_y": float(camera_matrix[1, 1]),
-        "c_x": float(camera_matrix[0, 2]),
-        "c_y": float(camera_matrix[1, 2]),
+        "focal_length_px": f_x,
+        "f_x": f_x,
+        "f_y": f_y,
+        "c_x": c_x,
+        "c_y": c_y,
         "image_width": int(image_size[0]),
         "image_height": int(image_size[1]),
         "rms_reprojection_error": float(rms),
@@ -149,6 +155,7 @@ def main() -> int:
     args.output.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     print(f"Saved calibration to {args.output}")
     print(f"f_x = {data['f_x']:.2f}px, f_y = {data['f_y']:.2f}px")
+    print(f"c_x = {data['c_x']:.2f}px, c_y = {data['c_y']:.2f}px")
     print(f"RMS reprojection error = {data['rms_reprojection_error']:.4f}")
     return 0
 
